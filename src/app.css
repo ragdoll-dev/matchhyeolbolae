@@ -1,0 +1,293 @@
+/*
+  src/app.css
+
+  전역 반응형 레이아웃 스타일 — 마추기(machugi.io) 방식 원칙 적용
+
+  변경 사항 (기존 app.css 대비)
+  1. --page-padding-x/y, --section-padding, --gap-* 를 rem 대신 px 로 고정
+  2. --font-* 를 rem 대신 px 로 고정 (해상도·배율 영향 제거)
+  3. 태블릿 브레이크포인트에서 --container-max-width 를 100% 로 풀지 않고
+     마추기처럼 한 단계 낮은 고정 px 값으로만 축소
+  4. 나머지 색상 변수, 유틸리티 클래스, 스크롤바 스타일은 그대로 유지
+*/
+
+:root {
+    /* 컨테이너 최대 너비: 고정 px, 화면이 커지면 좌우 여백만 증가 */
+    --container-max-width: 1200px;
+
+    /* 페이지 패딩: rem 대신 px 고정 */
+    --page-padding-x: 24px;
+    --page-padding-y: 40px;
+
+    /* 섹션 패딩 */
+    --section-padding: 22px;
+
+    /* 간격 */
+    --gap-sm: 8px;
+    --gap-md: 13px;
+    --gap-lg: 22px;
+
+    /* 폰트 크기: rem 대신 px 고정 (마추기 방식과 동일) */
+    --font-xs: 12px;
+    --font-sm: 14px;
+    --font-base: 15px;
+    --font-lg: 17px;
+    --font-xl: 20px;
+    --font-2xl: 24px;
+    --font-3xl: 28px;
+
+    /* 색상 변수 (기존 테마 유지) */
+    --color-bg-gradient-start: #6a5cf0;
+    --color-bg-gradient-mid: #4c3fd6;
+    --color-bg-gradient-end: #5b4fe0;
+    --color-surface: #4c3fd6;
+    --color-surface-dark: #372c8f;
+    --color-surface-darker: #241c5e;
+    --color-border: #2d2470;
+    --color-text-primary: #ffffff;
+    --color-text-secondary: #e5e3ff;
+    --color-text-muted: #9d97c2;
+    --color-accent: #ffd54a;
+    --color-accent-text: #5a3d00;
+    --color-error: #ffb4b4;
+    --color-disabled: #8b8fb5;
+}
+
+/* 기본 리셋 */
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+html {
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+    font-family:
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        'Segoe UI',
+        Roboto,
+        sans-serif;
+    font-size: var(--font-base);
+    line-height: 1.5;
+    color: var(--color-text-primary);
+    background: linear-gradient(
+        135deg,
+        var(--color-bg-gradient-start) 0%,
+        var(--color-bg-gradient-mid) 55%,
+        var(--color-bg-gradient-end) 100%
+    );
+}
+
+/* 공통 페이지 컨테이너: 고정 max-width, 화면이 커지면 좌우 여백만 증가 */
+.page-container {
+    width: 100%;
+    max-width: var(--container-max-width);
+    margin: 0 auto;
+    padding: var(--page-padding-y) var(--page-padding-x);
+}
+
+/* 공통 섹션 스타일 */
+.section {
+    padding: var(--section-padding);
+    border: 2px solid var(--color-border);
+    border-radius: 14px;
+    background: var(--color-surface);
+}
+
+/* 공통 타이포그래피 */
+h1 {
+    margin: 0 0 10px;
+    font-size: var(--font-3xl);
+    font-weight: 900;
+    color: var(--color-text-primary);
+}
+
+h2 {
+    margin: 0 0 13px;
+    font-size: var(--font-lg);
+    font-weight: 800;
+    color: var(--color-text-secondary);
+}
+
+h3 {
+    margin: 0;
+    font-size: var(--font-base);
+    font-weight: 900;
+    color: var(--color-text-primary);
+}
+
+p {
+    margin: 0;
+}
+
+/* 공통 버튼 스타일 */
+.btn {
+    padding: 14px 22px;
+    border: 2px solid var(--color-disabled);
+    border-radius: 10px;
+    background: transparent;
+    color: var(--color-text-primary);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: var(--font-base);
+    font-weight: 800;
+    transition:
+        background 0.15s ease,
+        border-color 0.15s ease;
+}
+
+.btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.btn-primary {
+    border: none;
+    background: var(--color-accent);
+    color: var(--color-accent-text);
+}
+
+.btn-primary:hover:not(:disabled) {
+    background: #ffca1f;
+}
+
+/* 공통 입력 필드 스타일 */
+.input {
+    box-sizing: border-box;
+    padding: 14px 16px;
+    border: none;
+    border-radius: 10px;
+    background: #ffffff;
+    color: #1a1440;
+    font-family: inherit;
+    font-size: var(--font-base);
+}
+
+.input::placeholder {
+    color: #a3a3a3;
+}
+
+.input:focus {
+    outline: none;
+    border: 2px solid var(--color-accent);
+}
+
+/* 공통 에러 텍스트 */
+.error-text {
+    color: var(--color-error);
+    font-size: var(--font-sm);
+    font-weight: 700;
+}
+
+/* 공통 힌트 텍스트 */
+.hint-text {
+    color: var(--color-text-muted);
+    font-size: var(--font-xs);
+}
+
+/* 반응형 그리드 유틸리티: 카드 최소폭도 고정 px */
+.grid-auto-fit {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: var(--gap-lg);
+}
+
+/* 미디어 쿼리 브레이크포인트 (마추기 방식: 고정 px 단계적 축소, 100% 로 풀지 않음) */
+
+/* 태블릿 이하 (max-width: 1024px) */
+@media (max-width: 1024px) {
+    :root {
+        /* 100% 로 풀지 않고, 한 단계 낮은 고정 px 값으로 축소 */
+        --container-max-width: 900px;
+        --page-padding-x: 18px;
+        --page-padding-y: 32px;
+    }
+}
+
+/* 모바일 (max-width: 640px) */
+@media (max-width: 640px) {
+    :root {
+        --container-max-width: 100%;
+        --page-padding-x: 14px;
+        --page-padding-y: 22px;
+        --section-padding: 14px;
+    }
+
+    h1 {
+        font-size: var(--font-2xl);
+    }
+
+    h2 {
+        font-size: var(--font-base);
+    }
+
+    .grid-auto-fit {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* 유틸리티 클래스 */
+.text-center {
+    text-align: center;
+}
+
+.text-muted {
+    color: var(--color-text-muted);
+}
+
+.mb-sm {
+    margin-bottom: var(--gap-sm);
+}
+
+.mb-md {
+    margin-bottom: var(--gap-md);
+}
+
+.mb-lg {
+    margin-bottom: var(--gap-lg);
+}
+
+.mt-sm {
+    margin-top: var(--gap-sm);
+}
+
+.mt-md {
+    margin-top: var(--gap-md);
+}
+
+.mt-lg {
+    margin-top: var(--gap-lg);
+}
+
+/* 스크롤바 스타일 */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.1);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.3);
+}
