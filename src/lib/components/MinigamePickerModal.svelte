@@ -5,13 +5,23 @@
   - create 페이지, room 대기실 페이지에서 공통으로 사용
   - 검색(제목/설명), 정답 타입 필터, 카드 그리드 레이아웃
   - 선택 시 onSelect 콜백 호출 후 모달 닫힘
+  - readOnly 모드 지원: 방장이 아닌 참가자는 목록을 열람만 하고
+    카드를 클릭해도 선택/onSelect 호출이 발생하지 않는다.
 
-  사용 예:
+  사용 예 (선택 가능, 방장):
   <MinigamePickerModal
       bind:open={isPickerOpen}
       selectedMinigameId={selectedMinigameId}
       minQuestionsRequired={MIN_QUESTIONS_REQUIRED}
       onSelect={(minigame) => { selectMinigame(minigame); isPickerOpen = false; }}
+  />
+
+  사용 예 (열람만 가능, 참가자):
+  <MinigamePickerModal
+      bind:open={isPickerOpen}
+      selectedMinigameId={selectedMinigameId}
+      minQuestionsRequired={MIN_QUESTIONS_REQUIRED}
+      readOnly={true}
   />
 -->
 <script lang="ts">
@@ -32,12 +42,14 @@
         open = $bindable(false),
         selectedMinigameId = null,
         minQuestionsRequired = 5,
+        readOnly = false,
         onSelect
     }: {
         open: boolean;
         selectedMinigameId: string | null;
         minQuestionsRequired?: number;
-        onSelect: (minigame: MinigameOption) => void;
+        readOnly?: boolean;
+        onSelect?: (minigame: MinigameOption) => void;
     } = $props();
 
     let minigames = $state<MinigameOption[]>([]);
@@ -84,8 +96,9 @@
     }
 
     function handleSelect(minigame: MinigameOption) {
+        if (readOnly) return;
         if (minigame.question_count < minQuestionsRequired) return;
-        onSelect(minigame);
+        onSelect?.(minigame);
     }
 
     function closeModal() {
@@ -117,7 +130,7 @@
     <div class="modal-backdrop" onclick={handleBackdropClick} role="presentation">
         <div class="modal-shell" role="dialog" aria-modal="true" aria-label="미니게임 전체보기">
             <header class="modal-header">
-                <h2 class="modal-title">미니게임 전체보기</h2>
+                <h2 class="modal-title">{readOnly ? '미니게임 목록' : '미니게임 전체보기'}</h2>
                 <button type="button" class="modal-close-btn" onclick={closeModal} aria-label="닫기">
                     ✕
                 </button>
@@ -154,6 +167,10 @@
                         객관식
                     </button>
                 </div>
+
+                {#if readOnly}
+                    <p class="readonly-hint">방장만 미니게임을 변경할 수 있습니다. 목록은 열람만 가능합니다.</p>
+                {/if}
             </div>
 
             <div class="modal-body">
@@ -170,10 +187,11 @@
                 {:else}
                     <div class="minigame-grid">
                         {#each filteredMinigames as minigame (minigame.minigame_id)}
-                            {@const disabled = minigame.question_count < minQuestionsRequired}
+                            {@const insufficientQuestions = minigame.question_count < minQuestionsRequired}
+                            {@const disabled = readOnly || insufficientQuestions}
                             <button
                                 type="button"
-                                class="minigame-card {selectedMinigameId === minigame.minigame_id ? 'selected' : ''} {disabled ? 'disabled' : ''}"
+                                class="minigame-card {selectedMinigameId === minigame.minigame_id ? 'selected' : ''} {disabled ? 'disabled' : ''} {readOnly ? 'readonly' : ''}"
                                 onclick={() => handleSelect(minigame)}
                                 disabled={disabled}
                             >
@@ -188,7 +206,7 @@
                                 </p>
                                 <div class="card-footer">
                                     <span class="card-question-count">문제 {minigame.question_count}개</span>
-                                    {#if disabled}
+                                    {#if insufficientQuestions && !readOnly}
                                         <span class="card-warning">최소 {minQuestionsRequired}개 필요</span>
                                     {/if}
                                 </div>
@@ -314,6 +332,12 @@
         border-color: #6a5cf0;
     }
 
+    .readonly-hint {
+        margin: 0;
+        color: var(--color-text-muted);
+        font-size: 12px;
+    }
+
     .modal-body {
         flex: 1 1 auto;
         min-height: 0;
@@ -359,8 +383,22 @@
         opacity: 0.45;
     }
 
+    /*
+      readonly: 참가자가 열람만 하는 모드. disabled 스타일(흐림 처리)이
+      "문제 부족"으로 오해되지 않도록 불투명도를 정상으로 되돌리고,
+      커서만 기본값으로 바꿔 클릭 불가 상태임을 은은하게 알려준다.
+    */
+    .minigame-card.disabled.readonly {
+        cursor: default;
+        opacity: 1;
+    }
+
     .minigame-card:hover:not(.selected):not(.disabled) {
         border-color: var(--color-disabled);
+    }
+
+    .minigame-card.readonly:hover {
+        border-color: var(--color-border);
     }
 
     .card-header {

@@ -1,73 +1,53 @@
 <!--
   src/routes/room/[code]/play/+page.svelte
 
-  게임 진행 화면 — 마추기(machugi.io) 방식 반응형 원칙 적용 + 이중 패딩 버그 수정
-  + 4K 해상도 상단 정렬 고정 + 채팅 스크롤 밀림 수정 + 정답 배지/채팅 즉시 반영
-
-  버그 원인
-  - page-container(app.css)가 이미 상하 40px 패딩을 주고 있는데,
-    play-page 가 height 계산에는 그 값만 빼면서 자체 padding(16px/8px)을
-    추가로 더해서 실제 사용 가능한 공간보다 stage-shell 의 height 가 커져
-    좌석/채팅창 등 내부 요소가 여러 겹으로 겹쳐 보이는 현상이 발생했다.
-
-  추가 수정 사항 (누적)
-  1. .play-page 의 align-items 를 center → flex-start 로 변경.
-     center 정렬은 뷰포트 세로 크기에 비례해 위쪽 여백이 커지므로
-     4K 처럼 세로가 큰 해상도에서 스테이지가 화면 중앙 훨씬 아래로 내려가는
-     문제가 있었다. flex-start + 고정 margin-top 으로 해상도 무관하게
-     항상 동일한 위치에 스테이지가 위치하도록 고정했다.
-
-  2. 채팅 로그 스크롤을 requestAnimationFrame 한 번으로 처리했으나,
-     정답 배지(correct-player-banner)가 동시에 나타나면서 형제 요소의
-     레이아웃이 한 번 더 리플로우되어 scrollHeight 가 늦게 갱신되는
-     문제가 있었다. ResizeObserver 로 .chat-log 자체의 실제 크기 변화를
-     감지해서, 몇 차례 리플로우가 겹쳐도 항상 최종 상태 기준으로
-     맨 아래 스크롤을 다시 고정하도록 변경했다.
-
-  3. onChatMessage 에서 정답 메시지(is_correct_answer)를 받는 즉시
-     showCorrectWrongOverlays 를 호출해 O/X 배지와 정답자 배너를
-     그 자리에서 바로 그리도록 변경. 서버의 game_sessions UPDATE 를
-     기다리지 않는다.
-
-  4. 채팅 로그 자체가 입력 후 1~2초 늦게 뜨는 문제 수정. 기존에는
-     채팅 로그가 오직 Realtime onChatMessage 이벤트로만 추가되어,
-     RPC 응답 이후 Realtime 브로드캐스트 왕복 지연을 그대로 떠안았다.
-     이제 본인이 보낸 메시지는 send_message RPC 응답을 받는 즉시
-     낙관적으로 로그에 추가하고, 이후 Realtime 으로 동일 메시지가
-     도착하면 player_id 로 판별해 중복 추가를 막는다. 다른 플레이어의
-     메시지는 기존처럼 Realtime 수신 시점에 추가된다.
+  v28 - "방 나가기" 버튼이 실제로 DB 에서 플레이어를 제거하지 않던 버그 수정
+  - 근본 원인: handleLeaveRoom 이 goto('/') 로 페이지만 이동시키고
+    leave_room/cancel_room RPC 를 전혀 호출하지 않았음.
+    -> players 행이 DB 에 그대로 남아있어 cleanup_room_if_empty 트리거가 발동하지 않고,
+       하트비트가 끊긴 뒤 1분 cron(좀비 방 안전망)에서야 뒤늦게 정리되던 문제.
+  - 수정: 방장이면 cancel_room, 참가자면 leave_room 을 먼저 호출해
+    players 행을 실제로 삭제한 뒤 이동. 이러면:
+      - 혼자(솔로) 플레이 중 나가기 -> 즉시 players 0명 -> 트리거 즉시 발동 -> 방 삭제
+      - 여러 명 중 한 명 나가기 -> 남은 인원 있으므로 방은 유지, 본인만 제거
+      - 마지막 남은 한 명이 나가기 -> 즉시 트리거 발동 -> 방 삭제
 -->
 <script lang="ts">
     import { goto } from '$app/navigation';
     import { page } from '$app/stores';
     import {
-    	FRAME_HEIGHT,
-    	FRAME_WIDTH,
-    	getIdleFramePosition,
-    	sheetUrl,
-    	type AvatarGender
+        FRAME_HEIGHT,
+        FRAME_WIDTH,
+        getIdleFramePosition,
+        sheetUrl,
+        type AvatarGender
     } from '$lib/avatarSprite';
     import { toErrorMessage } from '$lib/errorMessage';
     import { getRoomPlayerId, saveRoomPlayerId } from '$lib/roomPlayerStorage';
     import { joinRoomPresence, type RoomPresenceHandle } from '$lib/roomPresence';
     import {
-    	subscribeToRoom,
-    	unsubscribeFromRoom,
-    	type ChatMessageRow,
-    	type GameSessionRow,
-    	type PlayerRow,
-    	type RoomRow
+        subscribeToRoom,
+        unsubscribeFromRoom,
+        type ChatMessageRow,
+        type GameSessionRow,
+        type PlayerRow,
+        type RoomRow
     } from '$lib/roomRealtime';
     import { msUntilDeadline, syncServerClock } from '$lib/serverClock';
     import { supabase } from '$lib/supabaseClient';
     import type { RealtimeChannel } from '@supabase/supabase-js';
     import { onDestroy, onMount, tick } from 'svelte';
 
+
     const roomCode = $page.params.code;
     const BUBBLE_VISIBLE_MS = 4000;
     const BOUNCE_DURATION_MS = 500;
     const TOTAL_SEATS = 16;
     const CHAT_MAX_LENGTH = 14;
+    const HINT_POLL_INTERVAL_MS = 250;
+    const HINT_POLL_MAX_ATTEMPTS = 10;
+    const CHANNEL_WARMUP_GRACE_MS = 3000;
+
 
     type BubbleState = {
         text: string;
@@ -76,10 +56,12 @@
         pending?: boolean;
     };
 
+
     type SendMessageResult = {
         is_correct?: boolean;
         won_race?: boolean;
     };
+
 
     type ChatLogEntry = {
         id: string;
@@ -88,11 +70,28 @@
         isCorrect: boolean;
     };
 
+
     let room = $state<RoomRow | null>(null);
     let players = $state<PlayerRow[]>([]);
     let session = $state<GameSessionRow | null>(null);
     let currentPrompt = $state<string | null>(null);
     let currentCorrectAnswers = $state<string[] | null>(null);
+    let currentHint = $state<string | null>(null);
+    let isHintVisible = $state(false);
+    let isRequestingHint = $state(false);
+    let hintRequesterCount = $state(0);
+    let hintTotalPlayers = $state(0);
+    let previousQuestionId = $state<string | null>(null);
+
+
+    let isRequestingSkip = $state(false);
+    let skipRequesterCount = $state(0);
+    let skipTotalPlayers = $state(0);
+    let hasTriggeredSkipAdvance = $state(false);
+
+
+    let isLeavingRoom = $state(false);
+
 
     let bubbles = $state<Record<string, BubbleState>>({});
     let bouncingPlayerIds = $state<Record<string, true>>({});
@@ -101,12 +100,17 @@
     let chatLog = $state<ChatLogEntry[]>([]);
     let seenChatMessageIds = new Set<string>();
 
+
+    let firstCorrectAt = $state<Record<string, string>>({});
+
+
     let myPlayerId = $state<string | null>(null);
     let chatInput = $state('');
     let pendingMessageText = $state<string | null>(null);
     let chatInputRef: HTMLInputElement | null = null;
     let chatLogRef: HTMLDivElement | null = null;
     let chatLogResizeObserver: ResizeObserver | null = null;
+
 
     let clockSyncError = $state<string | null>(null);
     let isClockSynced = $state(false);
@@ -120,13 +124,19 @@
     let revealedForSessionId = $state<string | null>(null);
     let advancedForSessionId = $state<string | null>(null);
 
+
     let channel: RealtimeChannel | null = null;
     let presenceHandle: RoomPresenceHandle | null = null;
     let tickTimer: ReturnType<typeof setInterval> | null = null;
     let bounceTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+    let hintPollTimer: ReturnType<typeof setTimeout> | null = null;
+    let skipPollTimer: ReturnType<typeof setTimeout> | null = null;
+    let channelReadyAt: number | null = null;
+
 
     let myPlayer = $derived(players.find((player) => player.id === myPlayerId) ?? null);
     let isHost = $derived(myPlayer?.is_host === true);
+
 
     let remainingSeconds = $derived.by(() => {
         void nowTick;
@@ -136,23 +146,24 @@
         return Math.max(0, Math.ceil(msUntilDeadline(targetIso) / 1000));
     });
 
+
     let myAlreadyCorrect = $derived(
         session?.phase === 'question' &&
         myPlayerId !== null &&
         bubbles[myPlayerId]?.isCorrect === true
     );
 
+
     let seats = $derived.by(() => {
         const slots: (PlayerRow | null)[] = new Array(TOTAL_SEATS).fill(null);
         const host = players.find((p) => p.is_host);
 
-        // ⚠️ 테스트용 임시 코드: 방장을 2열 첫 자리(index 8)로 강제 배치
         if (host) slots[8] = host;
 
         let seatIndex = 0;
         for (const player of players) {
             if (player.is_host || seatIndex >= TOTAL_SEATS) continue;
-            if (seatIndex === 8) seatIndex += 1; // 방장 자리(8)는 건너뜀
+            if (seatIndex === 8) seatIndex += 1;
             slots[seatIndex] = player;
             seatIndex += 1;
         }
@@ -161,30 +172,51 @@
     });
 
 
-    // ==========================
-    //           원본
-    // ==========================
-    // let seats = $derived.by(() => {
-    //     const slots: (PlayerRow | null)[] = new Array(TOTAL_SEATS).fill(null);
-    //     const host = players.find((p) => p.is_host);
-
-    //     if (host) slots[0] = host;
-
-    //     let seatIndex = 1;
-    //     for (const player of players) {
-    //         if (player.is_host || seatIndex >= TOTAL_SEATS) continue;
-    //         slots[seatIndex] = player;
-    //         seatIndex += 1;
-    //     }
-
-    //     return slots;
-    // });
-
     let correctPlayerNickname = $derived.by(() => {
         const correctId = Object.keys(correctOverlay)[0];
         if (!correctId) return null;
         return players.find((player) => player.id === correctId)?.nickname ?? null;
     });
+
+
+    let rankedPlayers = $derived.by(() => {
+        return players
+            .filter((p) => p.score > 0)
+            .sort((a, b) => {
+                if (b.score !== a.score) return b.score - a.score;
+                const aTime = firstCorrectAt[a.id] ?? '';
+                const bTime = firstCorrectAt[b.id] ?? '';
+                return aTime.localeCompare(bTime);
+            });
+    });
+
+
+    let hintButtonLabel = $derived.by(() => {
+        if (isRequestingHint) return '요청 중...';
+        if (isHintVisible) return `힌트 표시됨 (${hintRequesterCount}/${hintTotalPlayers})`;
+        return `힌트 보기 (${hintRequesterCount}/${hintTotalPlayers})`;
+    });
+
+
+    let skipButtonLabel = $derived.by(() => {
+        if (isRequestingSkip) return '요청 중...';
+        return `건너뛰기 (${skipRequesterCount}/${skipTotalPlayers})`;
+    });
+
+
+    function rankBadgeClass(position: number): string {
+        if (position === 1) return 'gold';
+        if (position === 2) return 'silver';
+        if (position === 3) return 'bronze';
+        return '';
+    }
+
+
+    function recordFirstCorrect(playerId: string, atIso: string) {
+        if (firstCorrectAt[playerId]) return;
+        firstCorrectAt = { ...firstCorrectAt, [playerId]: atIso };
+    }
+
 
     function spriteStyle(characterIndex: number, gender: string): string {
         const resolvedGender = (gender === 'male' ? 'male' : 'female') as AvatarGender;
@@ -192,12 +224,14 @@
         return `background-image: url(${sheetUrl(sheet)}); background-position: -${x}px -${y}px;`;
     }
 
+
     function splitNicknameLines(nickname: string): [string, string] {
         if (nickname.length <= 8) {
             return [nickname, ''];
         }
         return [nickname.slice(0, 6), nickname.slice(6, 12)];
     }
+
 
     function showBubble(playerId: string, text: string, isCorrect: boolean) {
         bubbles = {
@@ -215,6 +249,7 @@
         }
     }
 
+
     function showPendingBubble(playerId: string, text: string) {
         bubbles = {
             ...bubbles,
@@ -227,12 +262,14 @@
         };
     }
 
+
     function clearMyPendingBubble(message: string) {
         if (!myPlayerId || bubbles[myPlayerId]?.text !== message || !bubbles[myPlayerId]?.pending) return;
         const next = { ...bubbles };
         delete next[myPlayerId];
         bubbles = next;
     }
+
 
     function triggerBounce(playerId: string) {
         if (bounceTimers[playerId]) clearTimeout(bounceTimers[playerId]);
@@ -246,17 +283,12 @@
         }, BOUNCE_DURATION_MS);
     }
 
+
     function scrollChatToBottom() {
         if (chatLogRef) chatLogRef.scrollTop = chatLogRef.scrollHeight;
     }
 
-    /*
-      채팅 로그에 새 줄을 추가한 뒤 스크롤을 맨 아래로 고정한다.
-      requestAnimationFrame 으로 브라우저가 레이아웃을 확정한 다음 프레임에
-      한 번 스크롤을 맞추고, 이후 정답 배지 등장 등으로 형제 요소가 다시
-      리플로우되어 .chat-log 의 실제 크기가 바뀌는 경우까지는
-      ResizeObserver(onMount 에서 등록)가 뒤이어 보정한다.
-    */
+
     async function appendChatLog(entry: ChatLogEntry) {
         if (seenChatMessageIds.has(entry.id)) return;
         seenChatMessageIds.add(entry.id);
@@ -266,11 +298,13 @@
         requestAnimationFrame(scrollChatToBottom);
     }
 
+
     async function focusAnswerInput() {
         await tick();
         if (session?.phase !== 'question' || myAlreadyCorrect || isSendingMessage) return;
         chatInputRef?.focus();
     }
+
 
     function showCorrectWrongOverlays(correctPlayerId: string | null) {
         correctOverlay = {};
@@ -287,52 +321,225 @@
         for (const player of players) wrongOverlay[player.id] = true;
     }
 
+
+    function countRequesters(requestedBy: string[] | null): number {
+        if (!requestedBy || !Array.isArray(requestedBy)) return 0;
+        return requestedBy.length;
+    }
+
+
+    function updateHintState(hintRequestedBy: string[] | null, totalPlayers?: number) {
+        const requesterCount = countRequesters(hintRequestedBy);
+
+        if (isHintVisible && requesterCount < hintRequesterCount) {
+            return;
+        }
+
+        hintRequesterCount = requesterCount;
+
+        if (totalPlayers !== undefined) {
+            hintTotalPlayers = totalPlayers;
+        }
+
+        const effectiveTotal = totalPlayers !== undefined ? totalPlayers : hintTotalPlayers;
+
+        if (
+            session?.phase === 'question' &&
+            currentHint &&
+            effectiveTotal > 0 &&
+            requesterCount >= effectiveTotal
+        ) {
+            isHintVisible = true;
+            stopHintPolling();
+        }
+    }
+
+
+    function updateSkipState(skipRequestedBy: string[] | null, totalPlayers?: number) {
+        const requesterCount = countRequesters(skipRequestedBy);
+
+        if (requesterCount < skipRequesterCount && hasTriggeredSkipAdvance) {
+            return;
+        }
+
+        skipRequesterCount = requesterCount;
+
+        if (totalPlayers !== undefined) {
+            skipTotalPlayers = totalPlayers;
+        }
+
+        const effectiveTotal = totalPlayers !== undefined ? totalPlayers : skipTotalPlayers;
+
+        if (
+            session?.phase === 'question' &&
+            effectiveTotal > 0 &&
+            requesterCount >= effectiveTotal &&
+            !hasTriggeredSkipAdvance
+        ) {
+            hasTriggeredSkipAdvance = true;
+            stopSkipPolling();
+            if (isHost) {
+                void handleRevealAnswer();
+            }
+        }
+    }
+
+
+    function startHintPolling() {
+        stopHintPolling();
+        if (!room) return;
+
+        let attempts = 0;
+
+        const poll = async () => {
+            attempts += 1;
+            if (isHintVisible || attempts > HINT_POLL_MAX_ATTEMPTS || !room) {
+                stopHintPolling();
+                return;
+            }
+
+            const { data, error } = await supabase
+                .from('rooms')
+                .select('hint_requested_by')
+                .eq('id', room.id)
+                .single();
+
+            if (!error && data) {
+                updateHintState(data.hint_requested_by as string[] | null, players.length);
+            }
+
+            if (isHintVisible) {
+                stopHintPolling();
+                return;
+            }
+
+            const isWarmingUp = channelReadyAt === null || (Date.now() - channelReadyAt) < CHANNEL_WARMUP_GRACE_MS;
+            const nextInterval = isWarmingUp ? 150 : HINT_POLL_INTERVAL_MS;
+
+            hintPollTimer = setTimeout(poll, nextInterval);
+        };
+
+        const isWarmingUp = channelReadyAt === null || (Date.now() - channelReadyAt) < CHANNEL_WARMUP_GRACE_MS;
+        hintPollTimer = setTimeout(poll, isWarmingUp ? 100 : HINT_POLL_INTERVAL_MS);
+    }
+
+
+    function stopHintPolling() {
+        if (hintPollTimer) {
+            clearTimeout(hintPollTimer);
+            hintPollTimer = null;
+        }
+    }
+
+
+    function startSkipPolling() {
+        stopSkipPolling();
+        if (!room) return;
+
+        let attempts = 0;
+
+        const poll = async () => {
+            attempts += 1;
+            if (hasTriggeredSkipAdvance || attempts > HINT_POLL_MAX_ATTEMPTS || !room) {
+                stopSkipPolling();
+                return;
+            }
+
+            const { data, error } = await supabase
+                .from('rooms')
+                .select('skip_requested_by')
+                .eq('id', room.id)
+                .single();
+
+            if (!error && data) {
+                updateSkipState(data.skip_requested_by as string[] | null, players.length);
+            }
+
+            if (hasTriggeredSkipAdvance) {
+                stopSkipPolling();
+                return;
+            }
+
+            const isWarmingUp = channelReadyAt === null || (Date.now() - channelReadyAt) < CHANNEL_WARMUP_GRACE_MS;
+            const nextInterval = isWarmingUp ? 150 : HINT_POLL_INTERVAL_MS;
+
+            skipPollTimer = setTimeout(poll, nextInterval);
+        };
+
+        const isWarmingUp = channelReadyAt === null || (Date.now() - channelReadyAt) < CHANNEL_WARMUP_GRACE_MS;
+        skipPollTimer = setTimeout(poll, isWarmingUp ? 100 : HINT_POLL_INTERVAL_MS);
+    }
+
+
+    function stopSkipPolling() {
+        if (skipPollTimer) {
+            clearTimeout(skipPollTimer);
+            skipPollTimer = null;
+        }
+    }
+
+
     async function loadQuestionContext(questionId: string | null, phase: string) {
+        if (questionId !== previousQuestionId) {
+            isHintVisible = false;
+            hintRequesterCount = 0;
+            hintTotalPlayers = 0;
+            isRequestingHint = false;
+            stopHintPolling();
+
+            skipRequesterCount = 0;
+            skipTotalPlayers = 0;
+            isRequestingSkip = false;
+            hasTriggeredSkipAdvance = false;
+            stopSkipPolling();
+        }
+        
         if (!questionId) {
             currentPrompt = null;
             currentCorrectAnswers = null;
+            currentHint = null;
+            isHintVisible = false;
+            isRequestingHint = false;
+            hintRequesterCount = 0;
+            hintTotalPlayers = 0;
             return;
         }
 
         if (phase === 'reveal') {
             const { data } = await supabase
                 .from('questions')
-                .select('prompt, correct_answers')
+                .select('prompt, correct_answers, hint')
                 .eq('id', questionId)
                 .single();
 
             if (data) {
                 currentPrompt = data.prompt as string;
                 currentCorrectAnswers = data.correct_answers as string[];
+                currentHint = (data.hint as string | null) ?? null;
             }
 
-            // 정답 배지는 onChatMessage/handleSendMessage 에서 이미 즉시
-            // 반영되므로, 여기서는 아직 배지가 비어 있는 경우
-            // (예: 시간 초과로 아무도 못 맞혀 reveal 에 진입한 경우)에
-            // 한해서만 서버 기준으로 보정한다.
-            if (Object.keys(correctOverlay).length === 0 && Object.keys(wrongOverlay).length === 0) {
-                const { data: sessionData } = await supabase
-                    .from('game_sessions')
-                    .select('first_correct_player_id')
-                    .eq('question_id', questionId)
-                    .order('question_started_at', { ascending: false })
-                    .limit(1)
-                    .maybeSingle();
-
-                showCorrectWrongOverlays(sessionData?.first_correct_player_id ?? null);
-            }
+            isRequestingHint = false;
+            hintRequesterCount = 0;
+            hintTotalPlayers = 0;
+            stopHintPolling();
+            stopSkipPolling();
             return;
         }
 
         const { data } = await supabase
             .from('questions_public')
-            .select('prompt')
+            .select('prompt, display_hint')
             .eq('id', questionId)
             .single();
 
         if (data) {
             currentPrompt = data.prompt as string;
             currentCorrectAnswers = null;
+            currentHint = data.display_hint as string | null;
+            isHintVisible = false;
+            isRequestingHint = false;
+            hintRequesterCount = 0;
+            hintTotalPlayers = 0;
         }
 
         bubbles = {};
@@ -340,6 +547,7 @@
         correctOverlay = {};
         wrongOverlay = {};
     }
+
 
     async function loadInitialData() {
         isLoading = true;
@@ -358,7 +566,6 @@
             }
             room = roomData as RoomRow;
 
-            // 최초 조회 시점에 이미 게임이 끝났거나 대기실로 되돌아간 경우 즉시 이동
             if (room.status === 'finished') {
                 goto(`/room/${roomCode}/result`);
                 return;
@@ -375,6 +582,9 @@
 
             if (playerError) throw playerError;
             players = (playerData ?? []) as PlayerRow[];
+
+            updateHintState(roomData.hint_requested_by as string[] | null, players.length);
+            updateSkipState(roomData.skip_requested_by as string[] | null, players.length);
 
             const storedPlayerId = getRoomPlayerId(roomCode);
             let resolvedPlayerId = storedPlayerId && players.some((player) => player.id === storedPlayerId)
@@ -412,7 +622,12 @@
                 .maybeSingle();
 
             session = (sessionData ?? null) as GameSessionRow | null;
-            if (session) await loadQuestionContext(session.question_id, session.phase);
+            if (session) {
+                previousQuestionId = session.question_id;
+                await loadQuestionContext(session.question_id, session.phase);
+                updateHintState(roomData.hint_requested_by as string[] | null, players.length);
+                updateSkipState(roomData.skip_requested_by as string[] | null, players.length);
+            }
 
             try {
                 await syncServerClock();
@@ -423,7 +638,16 @@
 
             channel = subscribeToRoom(room.id, {
                 onRoomChange: (row) => {
+                    if (channelReadyAt === null) channelReadyAt = Date.now();
                     room = row;
+                    
+                    if (row.hint_requested_by !== undefined) {
+                        updateHintState(row.hint_requested_by as string[] | null, players.length);
+                    }
+                    if (row.skip_requested_by !== undefined) {
+                        updateSkipState(row.skip_requested_by as string[] | null, players.length);
+                    }
+                    
                     if (row.status === 'finished') {
                         goto(`/room/${roomCode}/result`);
                     } else if (row.status === 'waiting') {
@@ -431,24 +655,52 @@
                     }
                 },
                 onGameSessionChange: async (row) => {
+                    if (channelReadyAt === null) channelReadyAt = Date.now();
                     const phaseChanged = session?.id !== row.id || session?.phase !== row.phase;
                     session = row;
 
                     if (phaseChanged) {
+                        if (row.question_id !== previousQuestionId) {
+                            await supabase
+                                .from('rooms')
+                                .update({ hint_requested_by: [], skip_requested_by: [] })
+                                .eq('id', room.id);
+                            
+                            isHintVisible = false;
+                            hintRequesterCount = 0;
+                            hintTotalPlayers = players.length;
+                            isRequestingHint = false;
+                            stopHintPolling();
+
+                            skipRequesterCount = 0;
+                            skipTotalPlayers = players.length;
+                            isRequestingSkip = false;
+                            hasTriggeredSkipAdvance = false;
+                            stopSkipPolling();
+
+                            previousQuestionId = row.question_id;
+                        }
+                        
+                        await loadQuestionContext(row.question_id, row.phase);
+                        hintTotalPlayers = players.length;
+                        skipTotalPlayers = players.length;
+                        
                         chatInput = '';
                         pendingMessageText = null;
-                        await loadQuestionContext(row.question_id, row.phase);
                         await tick();
                         requestAnimationFrame(scrollChatToBottom);
                         if (row.phase === 'question') await focusAnswerInput();
                     }
                 },
                 onPlayerChange: (row, eventType, oldRow) => {
+                    if (channelReadyAt === null) channelReadyAt = Date.now();
                     if (eventType === 'DELETE') {
                         const removedId = oldRow?.id ?? row?.id;
                         if (removedId) {
                             players = players.filter((player) => player.id !== removedId);
                         }
+                        hintTotalPlayers = players.length;
+                        skipTotalPlayers = players.length;
                         return;
                     }
 
@@ -457,21 +709,19 @@
                     const index = players.findIndex((player) => player.id === row.id);
                     if (index === -1) {
                         players = [...players, row];
-                        return;
+                    } else {
+                        const next = [...players];
+                        next[index] = row;
+                        players = next;
                     }
-
-                    const next = [...players];
-                    next[index] = row;
-                    players = next;
+                    hintTotalPlayers = players.length;
+                    skipTotalPlayers = players.length;
                 },
                 onChatMessage: (row: ChatMessageRow) => {
+                    if (channelReadyAt === null) channelReadyAt = Date.now();
                     showBubble(row.player_id, row.message, row.is_correct_answer);
                     triggerBounce(row.player_id);
 
-                    // 본인이 보낸 메시지는 handleSendMessage 에서 RPC 응답을
-                    // 받는 시점에 이미 로그에 추가했으므로, Realtime 으로
-                    // 다시 도착해도 중복 추가하지 않는다(appendChatLog 내부의
-                    // seenChatMessageIds 로도 한 번 더 걸러진다).
                     if (row.player_id !== myPlayerId) {
                         const nickname = players.find((p) => p.id === row.player_id)?.nickname ?? '???';
                         void appendChatLog({
@@ -482,28 +732,19 @@
                         });
                     }
 
-                    // 정답 메시지를 받는 즉시 O/X 배지와 정답자 배너를 그린다.
-                    // 서버의 reveal_answer 응답이나 game_sessions UPDATE 를
-                    // 기다리지 않아도 되므로, 모든 클라이언트에서 판정과
-                    // 동시에 화면이 갱신된다.
                     if (
                         row.is_correct_answer &&
                         session?.phase === 'question' &&
                         row.question_id === session.question_id
                     ) {
                         showCorrectWrongOverlays(row.player_id);
+                        recordFirstCorrect(row.player_id, row.created_at);
 
                         if (isHost) void handleRevealAnswer();
                     }
                 }
             });
 
-            // subscribeToRoom 호출 전과 후 사이에 방장이 이미 end_game 이나
-            // restart_room 을 실행해버렸을 가능성을 방어한다. Realtime
-            // Postgres Changes 는 구독이 시작된 "이후"의 이벤트만 전달하므로,
-            // 구독 시작 직전에 이미 지나간 UPDATE(playing -> finished,
-            // finished -> waiting)는 영원히 수신하지 못할 수 있다. 따라서
-            // 구독을 건 직후 최신 상태를 한 번 더 직접 조회해서 방어한다.
             const { data: latestRoomData, error: latestRoomError } = await supabase
                 .from('rooms')
                 .select('*')
@@ -522,6 +763,8 @@
                     return;
                 }
                 room = latestRoomData as RoomRow;
+                updateHintState(latestRoomData.hint_requested_by as string[] | null, players.length);
+                updateSkipState(latestRoomData.skip_requested_by as string[] | null, players.length);
             }
 
             presenceHandle = joinRoomPresence(room.id, myPlayerId, () => room?.host_id ?? null);
@@ -544,6 +787,7 @@
             if (session?.phase === 'question') await focusAnswerInput();
         }
     }
+
 
     async function handleSendMessage(event: SubmitEvent) {
         event.preventDefault();
@@ -576,11 +820,6 @@
                 showBubble(myPlayerId, text, isCorrect);
             }
 
-            // 채팅 로그는 Realtime 브로드캐스트를 기다리지 않고, RPC 응답을
-            // 받는 즉시 본인 메시지를 낙관적으로 추가한다. 이렇게 하면
-            // 입력 후 로그에 뜨는 체감 속도가 말풍선과 동일해진다.
-            // 이후 Realtime 으로 같은 메시지가 도착하면 player_id 및
-            // seenChatMessageIds 로 걸러져 중복 추가되지 않는다.
             const nickname = myPlayer?.nickname ?? '???';
             void appendChatLog({
                 id: `local-${myPlayerId}-${Date.now()}`,
@@ -591,6 +830,7 @@
 
             if (isCorrect && session?.phase === 'question') {
                 showCorrectWrongOverlays(myPlayerId);
+                recordFirstCorrect(myPlayerId, new Date().toISOString());
             }
         } catch (err) {
             clearMyPendingBubble(text);
@@ -602,6 +842,107 @@
             await focusAnswerInput();
         }
     }
+
+
+    async function toggleHint() {
+        if (!room || !myPlayerId || session?.phase !== 'question' || isRequestingHint) return;
+        
+        isRequestingHint = true;
+        
+        try {
+            const { data, error } = await supabase.rpc('request_hint', {
+                p_room_id: room.id,
+                p_player_id: myPlayerId
+            });
+            
+            if (error) throw error;
+            
+            const result = data as { 
+                all_requested: boolean; 
+                hint_requested_by: string[];
+                total_players: number;
+                requester_count: number;
+            };
+            
+            updateHintState(result.hint_requested_by, result.total_players);
+
+            if (!result.all_requested) {
+                startHintPolling();
+            }
+        } catch (err) {
+            actionError = toErrorMessage(err);
+        } finally {
+            isRequestingHint = false;
+        }
+    }
+
+
+    async function toggleSkip() {
+        if (!room || !myPlayerId || session?.phase !== 'question' || isRequestingSkip || hasTriggeredSkipAdvance) return;
+
+        isRequestingSkip = true;
+
+        try {
+            const { data, error } = await supabase.rpc('request_skip', {
+                p_room_id: room.id,
+                p_player_id: myPlayerId
+            });
+
+            if (error) throw error;
+
+            const result = data as {
+                all_requested: boolean;
+                skip_requested_by: string[];
+                total_players: number;
+                requester_count: number;
+            };
+
+            updateSkipState(result.skip_requested_by, result.total_players);
+
+            if (!result.all_requested) {
+                startSkipPolling();
+            }
+        } catch (err) {
+            actionError = toErrorMessage(err);
+        } finally {
+            isRequestingSkip = false;
+        }
+    }
+
+
+    /**
+     * 방 나가기: 실제로 DB 에서 내 players 행을 제거하는 RPC 를 먼저 호출한 뒤 이동한다.
+     * - 방장이면 cancel_room: 남은 인원이 있으면 위임, 없으면(=혼자였던 경우) 방까지 즉시 삭제
+     * - 참가자면 leave_room: 내 players 행만 삭제. 이후 방에 아무도 안 남으면
+     *   players 테이블의 DELETE 트리거(cleanup_room_if_empty)가 즉시 방을 정리한다.
+     * 이 RPC 호출이 없으면 players 행이 그대로 남아 트리거가 발동하지 않고,
+     * 좀비 방 안전망(cron, 최대 1분+120초 유예)에서야 뒤늦게 정리되어 버린다.
+     */
+    async function handleLeaveRoom() {
+        if (!confirm('정말로 방을 나가시겠습니까?')) return;
+        if (!room || !myPlayerId || isLeavingRoom) return;
+
+        isLeavingRoom = true;
+        actionError = null;
+
+        try {
+            if (isHost) {
+                const { error } = await supabase.rpc('cancel_room', { p_room_id: room.id });
+                if (error) throw error;
+            } else {
+                const { error } = await supabase.rpc('leave_room', { p_room_id: room.id });
+                if (error) throw error;
+            }
+        } catch (err) {
+            console.error('[play] handleLeaveRoom RPC 실패:', err);
+            // RPC 가 실패해도 사용자는 방을 나가고 싶어했으므로 이동은 계속 진행한다.
+            // (남은 좀비 방 정리는 안전망 cron 이 처리한다)
+        } finally {
+            isLeavingRoom = false;
+            goto('/');
+        }
+    }
+
 
     async function handleRevealAnswer() {
         if (!room || !session || isRevealing) return;
@@ -665,6 +1006,7 @@
         }
     }
 
+
     async function handleAdvanceOrFinish() {
         if (!room || !session || isAdvancing) return;
         if (session.phase !== 'reveal') return;
@@ -717,6 +1059,7 @@
         }
     }
 
+
     function handlePageHide() {
         if (!room || !myPlayerId) return;
 
@@ -736,6 +1079,7 @@
         navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }));
     }
 
+
     $effect(() => {
         if (!isClockSynced || !isHost || !session) return;
         if (session.phase !== 'question' || remainingSeconds > 0) return;
@@ -743,12 +1087,14 @@
         void handleRevealAnswer();
     });
 
+
     $effect(() => {
         if (!isClockSynced || !isHost || !session) return;
         if (session.phase !== 'reveal' || remainingSeconds > 0) return;
         if (isAdvancing || advancedForSessionId === session.id) return;
         void handleAdvanceOrFinish();
     });
+
 
     onMount(() => {
         void loadInitialData();
@@ -761,16 +1107,41 @@
         }
     });
 
+
     onDestroy(() => {
         if (channel) unsubscribeFromRoom(channel);
         if (presenceHandle) presenceHandle.stop();
         if (tickTimer) clearInterval(tickTimer);
+        stopHintPolling();
+        stopSkipPolling();
         if (chatLogResizeObserver) chatLogResizeObserver.disconnect();
         for (const timer of Object.values(bounceTimers)) clearTimeout(timer);
     });
 </script>
 
+
 <div class="play-page">
+    <div class="realtime-ranking-widget">
+        <div class="ranking-widget-header">
+            <span class="trophy-icon">🏆</span>
+            <span class="ranking-widget-title">실시간 순위</span>
+        </div>
+
+        <ul class="ranking-widget-list">
+            {#if rankedPlayers.length === 0}
+                <li class="ranking-widget-empty">아직 정답자가 없습니다</li>
+            {:else}
+                {#each rankedPlayers as p, idx (p.id)}
+                    <li class="ranking-widget-item {p.id === myPlayerId ? 'me' : ''}">
+                        <span class="rank-badge {rankBadgeClass(idx + 1)}">{idx + 1}위</span>
+                        <span class="player-name-widget">{p.nickname}</span>
+                        <span class="score-badge">{p.score}점</span>
+                    </li>
+                {/each}
+            {/if}
+        </ul>
+    </div>
+
     {#if isLoading}
         <p class="status-text text-center">게임 정보를 불러오는 중...</p>
     {:else if loadError}
@@ -778,8 +1149,21 @@
     {:else if room && session}
         <div class="stage-shell">
             <header class="stage-header">
-                <span class="round-badge">{room.current_round} / {room.total_rounds} 라운드</span>
-                <span class="timer-badge">{remainingSeconds}초</span>
+                <span class="stage-header-spacer" aria-hidden="true"></span>
+
+                <span class="stage-header-meta">
+                    <span class="round-badge">{room.current_round} / {room.total_rounds} 라운드</span>
+                    <span class="timer-badge">{remainingSeconds}초</span>
+                </span>
+
+                <button
+                    type="button"
+                    class="leave-room-button"
+                    onclick={handleLeaveRoom}
+                    disabled={isLeavingRoom}
+                >
+                    {isLeavingRoom ? '나가는 중...' : '방 나가기'}
+                </button>
             </header>
 
             {#if clockSyncError || actionError}
@@ -787,8 +1171,49 @@
             {/if}
 
             <div class="prompt-board">
-                <span class="prompt-label">[{session.phase === 'question' ? '문제' : '정답 공개'}]</span>
+                <div class="prompt-heading-row">
+                    {#if session.phase === 'question' && currentHint}
+                        <button
+                            type="button"
+                            class="hint-toggle-button"
+                            onclick={toggleHint}
+                            aria-expanded={isHintVisible}
+                            disabled={isRequestingHint || isHintVisible}
+                        >
+                            {hintButtonLabel}
+                        </button>
+                    {:else}
+                        <span class="hint-toggle-spacer" aria-hidden="true"></span>
+                    {/if}
+
+                    <span class="prompt-label">[{session.phase === 'question' ? '문제' : '정답 공개'}]</span>
+
+                    {#if session.phase === 'question'}
+                        <button
+                            type="button"
+                            class="skip-round-button"
+                            onclick={toggleSkip}
+                            disabled={isRequestingSkip || hasTriggeredSkipAdvance}
+                        >
+                            {skipButtonLabel}
+                        </button>
+                    {:else}
+                        <span class="prompt-heading-spacer" aria-hidden="true"></span>
+                    {/if}
+                </div>
+
                 <p class="prompt-text">{currentPrompt ?? '문제를 불러오는 중...'}</p>
+
+                {#if session.phase === 'question' && isHintVisible && currentHint}
+                    <div class="hint-display-box show">
+                        <div class="hint-box-header">
+                            <span class="hint-box-icon">💡</span>
+                            <span>힌트</span>
+                        </div>
+                        <div class="hint-box-content">{currentHint}</div>
+                    </div>
+                {/if}
+
                 {#if session.phase === 'reveal' && currentCorrectAnswers}
                     <p class="answer-reveal-list">정답: {currentCorrectAnswers.join(', ')}</p>
                 {/if}
@@ -824,13 +1249,11 @@
                                         ></span>
                                     </div>
 
-                                    <!-- 닉네임: 기존 위치 그대로, 6자+6자 2줄만 적용 -->
                                     <span class="seat-nickname-lines">
                                         <span class="seat-nickname-line">{splitNicknameLines(seatPlayer.nickname)[0]}</span>
                                         <span class="seat-nickname-line">{splitNicknameLines(seatPlayer.nickname)[1]}</span>
                                     </span>
 
-                                    <!-- 점수 + 방장뱃지: 같은 줄, 점수가 왼쪽 그대로, 방장뱃지가 오른쪽 -->
                                     <div class="seat-bottom-row">
                                         {#if seatPlayer.is_host}
                                             <span class="seat-host-tag">방장</span>
@@ -885,18 +1308,8 @@
     {/if}
 </div>
 
-<style>
-    /*
-      전체 배경: 뷰포트를 채우되, 내부 stage-shell 크기는 고정 px 기반이라
-      화면이 커지면 배경 여백만 넓어진다.
 
-      align-items 를 center 대신 flex-start 로 변경했다. center 정렬은
-      남는 세로 공간의 절반을 위쪽 여백으로 만들기 때문에, FHD 에서는 여백이
-      작아 자연스러웠지만 4K 처럼 세로 해상도가 커지면 스테이지가 화면 중앙
-      훨씬 아래로 내려가 보이는 문제가 있었다. flex-start + stage-shell 의
-      고정 margin-top 조합으로 해상도와 무관하게 항상 동일한 위치에 스테이지가
-      위치하도록 고정했다.
-    */
+<style>
     .play-page {
         display: flex;
         align-items: flex-start;
@@ -908,15 +1321,120 @@
         overflow: hidden;
     }
 
-    /*
-      스테이지 전체: 고정 px 크기.
-      1280x860 을 기준 디자인으로 삼고, 화면이 작으면 브레이크포인트별로
-      한 단계씩만 축소한다. 화면이 커져도 이 값 이상으로 늘어나지 않는다.
+    .realtime-ranking-widget {
+        position: fixed;
+        top: 92px;
+        left: 24px;
+        z-index: 200;
+        display: flex;
+        width: 270px;
+        flex-direction: column;
+        box-sizing: border-box;
+        overflow: hidden;
+        border: 2px solid var(--color-border);
+        border-radius: 12px;
+        background: var(--color-surface-darker);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    }
 
-      margin-top 값은 FHD 기준으로 "지금 딱 좋다"고 확인된 여백을 고정값으로
-      못박은 것이다. align-items: flex-start 덕분에 이 값은 해상도와 무관하게
-      항상 동일하게 유지된다. 필요하면 이 숫자만 조정하면 된다.
-    */
+    .ranking-widget-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 10px 14px;
+        border-bottom: 2px solid var(--color-border);
+        background: var(--color-surface-dark);
+    }
+
+    .trophy-icon {
+        font-size: 16px;
+    }
+
+    .ranking-widget-title {
+        color: var(--color-text-primary);
+        font-size: 13px;
+        font-weight: 900;
+    }
+
+    .ranking-widget-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0;
+        margin: 0;
+        padding: 6px;
+        list-style: none;
+    }
+
+    .ranking-widget-empty {
+        padding: 10px 8px;
+        color: var(--color-text-muted);
+        font-size: 12px;
+        text-align: center;
+    }
+
+    .ranking-widget-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 8px;
+        border-radius: 6px;
+    }
+
+    .ranking-widget-item.me {
+        background: rgba(255, 213, 74, 0.16);
+    }
+
+    .rank-badge {
+        flex: 0 0 auto;
+        padding: 2px 7px;
+        border-radius: 6px;
+        background: var(--color-surface-dark);
+        color: var(--color-text-secondary);
+        font-size: 11px;
+        font-weight: 900;
+        white-space: nowrap;
+    }
+
+    .rank-badge.gold {
+        background: #ffd54a;
+        color: #5a3d00;
+    }
+
+    .rank-badge.silver {
+        background: #d8dce6;
+        color: #3a3f4a;
+    }
+
+    .rank-badge.bronze {
+        background: #d99a5b;
+        color: #4a2c0c;
+    }
+
+    .player-name-widget {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        color: var(--color-text-primary);
+        font-size: 13px;
+        font-weight: 700;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .score-badge {
+        flex: 0 0 auto;
+        color: var(--color-accent);
+        font-size: 13px;
+        font-weight: 900;
+        white-space: nowrap;
+    }
+
+    @media (max-width: 1400px) {
+        .realtime-ranking-widget {
+            display: none;
+        }
+    }
+
     .stage-shell {
         display: flex;
         flex-direction: column;
@@ -945,15 +1463,25 @@
         color: var(--color-error);
     }
 
-    /*
-      헤더: 고정 높이, 고정 폰트 크기
-    */
     .stage-header {
-        display: flex;
+        display: grid;
         flex: 0 0 40px;
+        grid-template-columns: 1fr auto 1fr;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .stage-header-meta {
+        grid-column: 2;
+        display: flex;
         align-items: center;
         justify-content: center;
         gap: 8px;
+    }
+
+    .stage-header-spacer {
+        grid-column: 1;
+        width: 1px;
     }
 
     .round-badge,
@@ -962,6 +1490,7 @@
         border-radius: 8px;
         font-size: 14px;
         font-weight: 800;
+        white-space: nowrap;
     }
 
     .round-badge {
@@ -974,12 +1503,10 @@
         color: var(--color-accent-text);
     }
 
-    /*
-      문제 보드: 고정 높이 140px
-    */
     .prompt-board {
         display: flex;
-        flex: 0 0 140px;
+        flex: 0 0 auto;
+        min-height: 140px;
         flex-direction: column;
         align-items: center;
         justify-content: center;
@@ -993,10 +1520,148 @@
         text-align: center;
     }
 
+    .prompt-heading-row {
+        display: grid;
+        width: 100%;
+        grid-template-columns: 1fr auto 1fr;
+        align-items: center;
+        gap: 12px;
+    }
+
     .prompt-label {
+        grid-column: 2;
+        display: inline-block;
         color: #1c4a73;
         font-size: 16px;
         font-weight: 900;
+        line-height: 1;
+        text-align: center;
+        white-space: nowrap;
+        vertical-align: baseline;
+    }
+
+    .hint-toggle-button {
+        grid-column: 1;
+        justify-self: start;
+        flex: 0 0 auto;
+        padding: 6px 10px;
+        border: 1px solid #f6c344;
+        border-radius: 999px;
+        background: #fff8df;
+        color: #8a5b00;
+        font: inherit;
+        font-size: 13px;
+        font-weight: 700;
+        line-height: 1.2;
+        white-space: nowrap;
+        cursor: pointer;
+    }
+
+    .skip-round-button {
+        grid-column: 3;
+        justify-self: end;
+        flex: 0 0 auto;
+        padding: 6px 10px;
+        border: 1px solid #6ba8e0;
+        border-radius: 999px;
+        background: #eaf4ff;
+        color: #1c4a73;
+        font: inherit;
+        font-size: 13px;
+        font-weight: 700;
+        line-height: 1.2;
+        white-space: nowrap;
+        cursor: pointer;
+    }
+
+    .skip-round-button:hover {
+        background: #d8ebff;
+    }
+
+    .skip-round-button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+    }
+
+    .leave-room-button {
+        justify-self: end;
+        flex: 0 0 auto;
+        padding: 6px 14px;
+        border: none;
+        border-radius: 8px;
+        background: #1c4a73;
+        color: #eaf6ff;
+        font: inherit;
+        font-size: 14px;
+        font-weight: 800;
+        white-space: nowrap;
+        cursor: pointer;
+    }
+
+    .leave-room-button:hover {
+        background: #245a8c;
+    }
+
+    .leave-room-button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+    }
+
+    .hint-toggle-spacer,
+    .prompt-heading-spacer {
+        grid-column: 1;
+        width: 1px;
+    }
+
+    .prompt-heading-spacer {
+        grid-column: 3;
+    }
+
+    .hint-toggle-button:hover {
+        background: #ffefb0;
+    }
+
+    .hint-toggle-button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+    }
+
+    /* 힌트 표시 박스 - 사용자 지정 스타일 */
+    .hint-display-box {
+        display: flex;
+        flex-direction: column;
+        box-sizing: border-box;
+        width: 60%;
+        margin: 12px 0 0;
+        padding: 12px 14px;
+        border: 2px solid rgb(171, 71, 188);
+        border-radius: 12px;
+        background: linear-gradient(135deg, rgb(255, 248, 225) 0%, rgb(255, 243, 196) 100%);
+        box-shadow: rgba(171, 71, 188, 0.2) 0px 4px 12px;
+    }
+
+    .hint-box-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-bottom: 6px;
+        color: rgb(171, 71, 188);
+        font-size: 13px;
+        font-weight: 800;
+    }
+
+    .hint-box-icon {
+        font-size: 14px;
+        line-height: 1;
+    }
+
+    .hint-box-content {
+        color: #6f4b00;
+        font-size: 22px;
+        font-weight: 800;
+        letter-spacing: 4px;
+        line-height: 1;
+        text-align: center;
     }
 
     .prompt-text {
@@ -1023,15 +1688,10 @@
         font-weight: 900;
     }
 
-    /*
-      좌석 영역: 고정 높이 420px.
-      말풍선(최대 74px) + 화살표 + 여유 공간을 top padding 에 고정으로 반영.
-      2 열 말풍선이 1 열 부스를 가리지 않도록 row-gap 도 고정값으로 확보.
-    */
     .seat-stage-wrap {
         position: relative;
         display: flex;
-        flex: 0 0 420px;
+        flex: 1 1 auto;
         min-height: 0;
         overflow: hidden;
         border-radius: 10px;
@@ -1057,9 +1717,6 @@
         margin: 0 auto;
     }
 
-    /*
-      좌석 부스: 고정 높이 132px. 4K 에서도 FHD 와 완전히 동일한 크기.
-    */
     .seat-booth {
         position: relative;
         display: flex;
@@ -1086,9 +1743,6 @@
         box-shadow: 0 0 0 2px var(--color-accent), inset 0 -3px 0 rgba(0, 0, 0, 0.15);
     }
 
-    /*
-      말풍선: 고정 px 크기. 최대 높이 74px 이므로 위 padding(88px)이면 충분히 여유롭다.
-    */
     .speech-bubble {
         position: absolute;
         bottom: calc(100% + 6px);
@@ -1302,13 +1956,10 @@
         animation: seat-overlay-pop 0.4s ease-out forwards;
     }
 
-    /*
-      푸터: 고정 높이 확보. 채팅 로그를 크게 잡고 입력창은 그 아래 고정.
-    */
     .stage-footer {
         display: flex;
         box-sizing: border-box;
-        flex: 1 1 auto;
+        flex: 0 0 auto;
         min-height: 0;
         flex-direction: column;
         gap: 8px;
@@ -1317,10 +1968,6 @@
         background: rgba(10, 30, 50, 0.55);
     }
 
-    /*
-      채팅 로그: 고정 높이가 아니라 flex: 1 로 남는 공간을 모두 채운다.
-      stage-shell 전체가 고정 px 이므로, 남는 세로 공간은 여기로만 흡수된다.
-    */
     .chat-log {
         display: flex;
         flex: 1 1 auto;
@@ -1374,51 +2021,40 @@
         font-weight: 700;
     }
 
-    /*
-      브레이크포인트 1: 1280px 미만 (노트북, 작은 데스크톱 창)
-      stage-shell 자체를 한 단계 축소한 고정 크기로 교체한다.
-      내부 좌석 크기, 폰트, gap 은 비율에 맞춰 함께 한 단계 축소.
-    */
     @media (max-width: 1280px) {
         .stage-shell {
             max-width: 1040px;
             height: 760px;
         }
 
-        .seat-stage-wrap {
-            flex-basis: 360px;
-        }
-
-        .seat-stage {
-            row-gap: 52px;
-            padding: 74px 10px 10px;
-        }
-
-        .seat {
-            max-width: 112px;
-        }
-
-        .seat-booth {
-            height: 112px;
-        }
-
-        .seat-avatar {
-            transform: scale(1.1);
-        }
-
         .prompt-board {
-            flex-basis: 120px;
+            min-height: 120px;
         }
 
         .prompt-text {
             font-size: 24px;
         }
+        
+        .hint-toggle-button,
+        .skip-round-button {
+            padding: 5px 8px;
+            font-size: 12px;
+        }
+
+        .leave-room-button {
+            padding: 5px 10px;
+            font-size: 13px;
+        }
+        
+        .hint-display-box {
+            padding: 10px 12px;
+        }
+
+        .hint-box-content {
+            font-size: 19px;
+        }
     }
 
-    /*
-      브레이크포인트 2: 900px 미만 (태블릿)
-      8 열 그리드를 4 열로 변경. 좌석 크기는 유지한다.
-    */
     @media (max-width: 900px) {
         .play-page {
             padding: 0;
@@ -1435,8 +2071,8 @@
             padding: 70px 10px 10px;
         }
 
-        .seat-stage-wrap {
-            flex-basis: 460px;
+        .hint-display-box {
+            width: 90%;
         }
 
         .prompt-text {
@@ -1444,12 +2080,6 @@
         }
     }
 
-    /*
-      브레이크포인트 3: 640px 미만 (모바일)
-      세로 스크롤 허용, 2 열 그리드로 축소.
-
-      여기서도 자체 padding(8px)을 제거해 min-height 계산과 어긋나지 않게 한다.
-    */
     @media (max-width: 640px) {
         .play-page {
             height: auto;
@@ -1464,6 +2094,34 @@
             margin-top: 0;
         }
 
+        .stage-header {
+            grid-template-columns: auto 1fr auto;
+        }
+
+        .prompt-heading-row {
+            grid-template-columns: auto 1fr auto;
+        }
+
+        .hint-toggle-button,
+        .skip-round-button {
+            font-size: 11px;
+            padding: 4px 7px;
+        }
+
+        .leave-room-button {
+            font-size: 12px;
+            padding: 4px 10px;
+        }
+
+        .hint-display-box {
+            width: 100%;
+        }
+
+        .hint-box-content {
+            font-size: 16px;
+            letter-spacing: 2px;
+        }
+
         .seat-stage {
             grid-template-columns: repeat(2, 1fr);
             row-gap: 48px;
@@ -1471,12 +2129,11 @@
         }
 
         .seat-stage-wrap {
-            flex-basis: auto;
             min-height: 640px;
         }
 
         .prompt-board {
-            flex-basis: 110px;
+            min-height: 110px;
         }
 
         .prompt-text {

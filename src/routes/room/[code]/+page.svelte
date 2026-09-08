@@ -1,7 +1,7 @@
 <!--
   src/routes/room/[code]/+page.svelte
 
-  대기실 페이지 — Ready 시스템 적용 버전
+  대기실 페이지 — Ready 시스템 적용 버전 + 미니게임 전체보기 모달 연동
 
   변경 사항 (기존 대비)
   - PlayerRow에 is_ready 필드 사용 (players 테이블에 컬럼 추가됨, DB 마이그레이션 완료)
@@ -11,11 +11,16 @@
   - 참가자 화면: 기존 waiting-text 자리를 레디 버튼으로 교체
   - 닉네임 옆에 host-badge와 동일한 스타일의 player-badge("준비완료") 추가
   - 서버(start_round RPC)에도 동일한 검증이 추가되어 있어 클라이언트 우회 불가
+  - 미니게임 선택 UI를 인라인 리스트에서 MinigamePickerModal 공용 모달로 교체
+    (전체보기 버튼 → 모달 오픈 → 검색/필터된 카드 그리드에서 선택)
+  - 참가자(비방장)도 "미니게임 목록 보기" 버튼으로 동일한 모달을 열람 전용(readOnly)으로
+    확인할 수 있음. 선택/변경은 방장만 가능 (MinigamePickerModal의 readOnly prop으로 제어)
 -->
 <script lang="ts">
     import { goto } from '$app/navigation';
     import { page } from '$app/stores';
     import { FRAME_HEIGHT, FRAME_WIDTH, getIdleFramePosition, sheetUrl, type AvatarGender } from '$lib/avatarSprite';
+    import MinigamePickerModal from '$lib/components/MinigamePickerModal.svelte';
     import { toErrorMessage } from '$lib/errorMessage';
     import { getRoomPlayerId, removeRoomPlayerId } from '$lib/roomPlayerStorage';
     import { joinRoomPresence, type RoomPresenceHandle } from '$lib/roomPresence';
@@ -63,6 +68,7 @@
     let isLeaving = $state(false);
     let isTransferringHost = $state(false);
     let isTogglingReady = $state(false);
+    let isMinigamePickerOpen = $state(false);
 
     let contextMenu = $state<ContextMenuState | null>(null);
     let selectedTransferPlayerId = $state<string | null>(null);
@@ -627,7 +633,7 @@
                 <section class="section players-section">
                     <h2 class="section-title">참가자 ({players.length}/{room.max_players})</h2>
                     {#if isHost}
-                        <p class="hint-text">참가자 칸을 우클릭하거나 클릭하면 방장을 위임할 수 있습니다.</p>
+                        <p class="hint-text">다른 참가자를 우클릭하거나 클릭하면 방장을 위임할 수 있습니다.</p>
                     {/if}
 
                     <ul class="player-list">
@@ -686,32 +692,17 @@
                 </section>
 
                 <section class="section minigame-section">
-                    <h2 class="section-title">미니게임</h2>
+                    <h2 class="section-title">미니게임 선택</h2>
 
                     {#if isHost}
                         <div class="minigame-panel">
-                            <ul class="minigame-list">
-                                {#each minigames as minigame (minigame.minigame_id)}
-                                    {@const disabled = minigame.question_count < MIN_QUESTIONS_REQUIRED}
-                                    <li>
-                                        <button
-                                            type="button"
-                                            class="minigame-list-item {room.minigame_id === minigame.minigame_id ? 'selected' : ''} {disabled ? 'disabled' : ''}"
-                                            onclick={() => handleSelectMinigame(minigame)}
-                                            disabled={disabled || isChangingMinigame}
-                                        >
-                                            {minigame.title}
-                                        </button>
-                                    </li>
-                                {/each}
-                            </ul>
                             <div class="minigame-detail">
                                 {#if currentMinigame}
                                     <h3 class="minigame-detail-title">{currentMinigame.title}</h3>
                                     <p class="minigame-detail-desc">
                                         {currentMinigame.description ?? '설명이 없습니다.'}
                                     </p>
-                                    <p class="minigame-detail-meta">총 문제 {currentMinigame.question_count}개 보유</p>
+                                    <p class="minigame-detail-meta">총 {currentMinigame.question_count}문제 보유</p>
                                     {#if isChangingMinigame}
                                         <p class="minigame-detail-note">미니게임을 변경하는 중입니다...</p>
                                     {/if}
@@ -719,6 +710,14 @@
                                     <p class="minigame-detail-placeholder">미니게임을 선택하세요.</p>
                                 {/if}
                             </div>
+                            <button
+                                type="button"
+                                class="minigame-picker-btn"
+                                onclick={() => (isMinigamePickerOpen = true)}
+                                disabled={isChangingMinigame}
+                            >
+                                다른 미니게임 전체보기
+                            </button>
                         </div>
                     {:else if currentMinigame}
                         <div class="minigame-readonly-panel">
@@ -726,8 +725,15 @@
                             <p class="minigame-detail-desc">
                                 {currentMinigame.description ?? '설명이 없습니다.'}
                             </p>
-                            <p class="minigame-detail-meta">총 문제 {currentMinigame.question_count}개 보유</p>
+                            <p class="minigame-detail-meta">총 {currentMinigame.question_count}문제 보유</p>
                             <p class="minigame-detail-note">방장만 미니게임을 변경할 수 있습니다.</p>
+                            <button
+                                type="button"
+                                class="minigame-picker-btn"
+                                onclick={() => (isMinigamePickerOpen = true)}
+                            >
+                                미니게임 목록 보기
+                            </button>
                         </div>
                     {:else}
                         <p class="status-text text-center">방장이 미니게임을 아직 선택하지 않았습니다.</p>
@@ -774,6 +780,21 @@
                 {contextMenu.nickname}님에게 방장 위임
             </button>
         </div>
+    {/if}
+
+    {#if room}
+        <MinigamePickerModal
+            bind:open={isMinigamePickerOpen}
+            selectedMinigameId={room.minigame_id}
+            minQuestionsRequired={MIN_QUESTIONS_REQUIRED}
+            readOnly={!isHost}
+            onSelect={isHost
+                ? (minigame) => {
+                      handleSelectMinigame(minigame);
+                      isMinigamePickerOpen = false;
+                  }
+                : undefined}
+        />
     {/if}
 </div>
 
@@ -1151,50 +1172,15 @@
         flex: 0 0 auto;
     }
 
+    /*
+      minigame-panel: 미니게임 요약(상세) + "미니게임 전체보기" 버튼을
+      세로로 배치하는 컨테이너. 기존 인라인 리스트(minigame-list)는
+      MinigamePickerModal 로 대체되어 더 이상 사용하지 않는다.
+    */
     .minigame-panel {
         display: flex;
-        gap: 14px;
-    }
-
-    /*
-      미니게임 리스트: 폭 40%, 최대 높이 260px 고정.
-    */
-    .minigame-list {
-        display: flex;
-        width: 40%;
-        max-height: 260px;
         flex-direction: column;
-        gap: 8px;
-        margin: 0;
-        padding: 0;
-        overflow-y: auto;
-        list-style: none;
-    }
-
-    .minigame-list-item {
-        width: 100%;
-        padding: 10px 13px;
-        border: 2px solid var(--color-surface-dark);
-        border-radius: 8px;
-        background: var(--color-surface-dark);
-        color: var(--color-text-secondary);
-        cursor: pointer;
-        font-family: inherit;
-        font-size: 16px;
-        font-weight: 800;
-        text-align: left;
-        transition: border-color 0.15s ease, background 0.15s ease;
-    }
-
-    .minigame-list-item.selected {
-        border-color: var(--color-accent);
-        background: var(--color-surface-darker);
-        color: var(--color-accent);
-    }
-
-    .minigame-list-item.disabled {
-        cursor: not-allowed;
-        opacity: 0.45;
+        gap: 12px;
     }
 
     .minigame-detail {
@@ -1254,6 +1240,28 @@
 
     .start-btn {
         flex: 1;
+    }
+
+    .minigame-picker-btn {
+        flex: 0 0 auto;
+        padding: 9px 18px;
+        border: 2px solid var(--color-accent);
+        border-radius: 9px;
+        background: transparent;
+        color: var(--color-accent);
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: 800;
+        white-space: nowrap;
+    }
+
+    .minigame-picker-btn:hover:not(:disabled) {
+        background: rgba(255, 213, 74, 0.12);
+    }
+
+    .minigame-picker-btn:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
     }
 
     /*
@@ -1329,15 +1337,6 @@
 
         .room-meta-row {
             order: 1;
-        }
-
-        .minigame-panel {
-            flex-direction: column;
-        }
-
-        .minigame-list {
-            width: 100%;
-            max-height: 200px;
         }
     }
 
